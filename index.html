@@ -242,6 +242,304 @@ const contactShadow = new THREE.Mesh(
 contactShadow.position.y = 0.01;
 scene.add(contactShadow);
 
+// ---------- 宇宙モード（増え続けるまんじゅうの行き着く先） ----------
+const SPACE_VOL = 1e12;          // 体積がこれ以上（半径6km超）になったら惑星ビューへ
+const STAR_MASS = 1.6e29;        // 恒星の点火限界 ≈ 0.08太陽質量 [kg]
+const SUN_MASS = 1.989e30;
+const BH_COEF = 9.28e-25;        // シュバルツシルト半径[m] = BH_COEF × 体積[m³]（密度625kg/m³）
+
+// 比較天体（半径の小さい順）。まんじゅう球の1/100未満になったら「卒業」して次へ
+const CELESTIAL_REFS = [
+  { r: 1.1e4,   name: 'フォボス（火星の衛星）', color: 0x8a7f72 },
+  { r: 4.7e5,   name: '準惑星ケレス',           color: 0x9a8d7d },
+  { r: 1.737e6, name: '月',                     color: 0xc8c4bb },
+  { r: 6.371e6, name: '地球',                   color: 0x4a7fbf },
+  { r: 7.0e7,   name: '木星',                   color: 0xc9a06b },
+  { r: 6.96e8,  name: '太陽',                   color: 0xffcc55, glow: true },
+  { r: 1.19e9,  name: 'シリウスA',              color: 0xcfe0ff, glow: true },
+  { r: 1.8e10,  name: 'アークトゥルス',         color: 0xffaa66, glow: true },
+  { r: 6.2e11,  name: 'ベテルギウス',           color: 0xff6644, glow: true },
+];
+
+function makeManjuPlanetTexture() { // 無数のまんじゅうでできた惑星の表面
+  const c = document.createElement('canvas');
+  c.width = c.height = 1024;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#caa05f';
+  ctx.fillRect(0, 0, 1024, 1024);
+  for (let i = 0; i < 5000; i++) {
+    const x = Math.random() * 1024, y = Math.random() * 1024;
+    const r = 5 + Math.random() * 10;
+    const g = ctx.createRadialGradient(x, y - r * 0.3, r * 0.1, x, y, r);
+    g.addColorStop(0, '#a96a28');
+    g.addColorStop(0.7, '#c08a44');
+    g.addColorStop(1, '#caa05f');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+function makeGlowTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(128, 128, 0, 128, 128, 128);
+  g.addColorStop(0, 'rgba(255,200,120,0.9)');
+  g.addColorStop(0.4, 'rgba(255,150,60,0.35)');
+  g.addColorStop(1, 'rgba(255,120,40,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 256, 256);
+  return new THREE.CanvasTexture(c);
+}
+
+function makeLabel() { // 天体の上に出す2行テキスト
+  const c = document.createElement('canvas');
+  c.width = 1024; c.height = 220;
+  const ctx = c.getContext('2d');
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false }));
+  sprite.scale.set(11, 11 * 220 / 1024, 1);
+  return {
+    sprite,
+    set(line1, line2) {
+      ctx.clearRect(0, 0, 1024, 1024);
+      ctx.textAlign = 'center';
+      ctx.lineWidth = 8;
+      ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+      ctx.fillStyle = '#ffe2b8';
+      ctx.font = 'bold 64px sans-serif';
+      ctx.strokeText(line1, 512, 80);
+      ctx.fillText(line1, 512, 80);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '52px sans-serif';
+      ctx.strokeText(line2, 512, 170);
+      ctx.fillText(line2, 512, 170);
+      tex.needsUpdate = true;
+    },
+  };
+}
+
+function formatDist(m) {
+  if (!Number.isFinite(m)) return '∞';
+  const LY = 9.46e15;
+  if (m >= LY * 0.1) return `${trimNum(m / LY)} 光年`;
+  if (m >= 1e12) return `${trimNum(m / 1e12)} 億km`;
+  if (m >= 1e8) return `${trimNum(m / 1e7)} 万km`;
+  return `${Math.round(m / 1000).toLocaleString('ja-JP')} km`;
+}
+
+const space = {
+  active: false, stage: '', refIdx: -2, lastGen: -1,
+  group: null, manjuBall: null, refBall: null, glow: null, disk: null,
+  manjuLabel: null, refLabel: null,
+};
+
+function buildSpace() {
+  if (space.group) return;
+  space.group = new THREE.Group();
+  space.group.visible = false;
+  scene.add(space.group);
+
+  space.manjuBall = new THREE.Mesh(
+    new THREE.SphereGeometry(1, 48, 32),
+    new THREE.MeshStandardMaterial({ map: makeManjuPlanetTexture(), roughness: 0.8 })
+  );
+  space.group.add(space.manjuBall);
+
+  space.refBall = new THREE.Mesh(
+    new THREE.SphereGeometry(1, 48, 32),
+    new THREE.MeshStandardMaterial({ roughness: 0.7 })
+  );
+  space.group.add(space.refBall);
+
+  const glowTex = makeGlowTexture();
+  space.glow = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: glowTex, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false,
+  }));
+  space.glow.visible = false;
+  space.group.add(space.glow);
+
+  space.refGlow = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: glowTex, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false,
+  }));
+  space.refGlow.visible = false;
+  space.group.add(space.refGlow);
+
+  // ブラックホールの降着円盤（まんじゅう色に輝く）
+  const diskTex = (() => {
+    const c = document.createElement('canvas');
+    c.width = 256; c.height = 64;
+    const ctx = c.getContext('2d');
+    const g = ctx.createLinearGradient(0, 0, 256, 0);
+    g.addColorStop(0, 'rgba(255,230,170,1)');
+    g.addColorStop(0.5, 'rgba(255,150,60,0.7)');
+    g.addColorStop(1, 'rgba(180,80,30,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, 256, 64);
+    return new THREE.CanvasTexture(c);
+  })();
+  const diskGeo = new THREE.RingGeometry(1.25, 3.2, 64);
+  // リング半径方向にグラデーションを乗せるためUVを書き換える
+  {
+    const pos = diskGeo.attributes.position, uv = diskGeo.attributes.uv;
+    for (let i = 0; i < pos.count; i++) {
+      const d = Math.hypot(pos.getX(i), pos.getY(i));
+      uv.setXY(i, (d - 1.25) / (3.2 - 1.25), 0.5);
+    }
+  }
+  space.disk = new THREE.Mesh(diskGeo, new THREE.MeshBasicMaterial({
+    map: diskTex, blending: THREE.AdditiveBlending, transparent: true,
+    side: THREE.DoubleSide, depthWrite: false,
+  }));
+  space.disk.rotation.x = Math.PI * 0.42;
+  space.disk.visible = false;
+  space.group.add(space.disk);
+
+  space.manjuLabel = makeLabel();
+  space.group.add(space.manjuLabel.sprite);
+  space.refLabel = makeLabel();
+  space.group.add(space.refLabel.sprite);
+}
+
+function enterSpace() {
+  buildSpace();
+  space.active = true;
+  space.stage = '';
+  space.refIdx = -2;
+  space.lastGen = -1;
+  space.group.visible = true;
+  pile.visible = false;
+  ground.visible = false;
+  contactShadow.visible = false;
+  controls.maxPolarAngle = Math.PI;
+  showToast('🪐 もはや天体サイズ。宇宙から眺めましょう');
+}
+
+function exitSpace() {
+  if (!space.active) return;
+  space.active = false;
+  space.stage = '';
+  if (space.group) space.group.visible = false;
+  pile.visible = true;
+  ground.visible = true;
+  contactShadow.visible = true;
+  controls.maxPolarAngle = Math.PI * 0.49;
+}
+
+function applySpaceStage(stage) {
+  space.stage = stage;
+  const m = space.manjuBall.material;
+  if (stage === 'planet') {
+    m.color.set(0xffffff); m.emissive.set(0x000000); m.emissiveMap = null;
+    m.needsUpdate = true;
+    space.glow.visible = false;
+    space.disk.visible = false;
+    $('mode').textContent = '🪐 まんじゅう惑星モード';
+  } else if (stage === 'star') {
+    m.emissive.set(0xff9933);
+    m.emissiveIntensity = 0.9;
+    m.emissiveMap = m.map;
+    m.needsUpdate = true;
+    space.glow.visible = true;
+    space.disk.visible = false;
+    $('mode').textContent = '☀️ まんじゅう恒星モード';
+    showToast('☀️ 質量が恒星の点火限界を突破！まんじゅうが輝き始めました');
+  } else if (stage === 'blackhole') {
+    m.color.set(0x000000); m.emissive.set(0x000000); m.emissiveMap = null;
+    m.needsUpdate = true;
+    space.glow.visible = true;
+    space.disk.visible = true;
+    $('mode').textContent = '🕳 まんじゅうブラックホール';
+    showToast('🕳 自らの重力で崩壊…まんじゅうはブラックホールになりました');
+  }
+}
+
+function updateSpace(vol, mass) {
+  // ステージ判定：惑星 → 恒星（点火限界） → ブラックホール（シュバルツシルト半径 > 実半径）
+  const bodyR = Math.cbrt(vol * 3 / (4 * Math.PI));
+  const schwR = BH_COEF * vol;
+  const stage = (!Number.isFinite(vol) || schwR >= bodyR) ? 'blackhole'
+    : mass >= STAR_MASS ? 'star' : 'planet';
+  if (stage !== space.stage) applySpaceStage(stage);
+  const R = stage === 'blackhole' ? schwR : bodyR;
+
+  // 比較天体：まんじゅう球の1/100未満になったら次へ。全て卒業したら単独表示
+  let refIdx = CELESTIAL_REFS.findIndex(ref => ref.r > R / 100);
+  if (!Number.isFinite(R)) refIdx = -1;
+  const ref = refIdx >= 0 ? CELESTIAL_REFS[refIdx] : null;
+
+  // 表示サイズ：大きい方を8ユニットに正規化して並べる
+  const maxR = ref ? Math.max(R, ref.r) : R;
+  const DM = Math.max(0.12, 8 * (Number.isFinite(R) ? R / maxR : 1));
+  const DR = ref ? Math.max(0.12, 8 * ref.r / maxR) : 0;
+  const gap = 2.5;
+  // まんじゅう球を左、比較天体を右に（全体の中心を原点へ）
+  const total = ref ? DM * 2 + gap + DR * 2 : DM * 2;
+  const manjuX = ref ? -(total / 2) + DM : 0;
+  const refX = ref ? total / 2 - DR : 0;
+
+  space.manjuBall.scale.setScalar(DM);
+  space.manjuBall.position.set(manjuX, 0, 0);
+  space.manjuBall.rotation.y += 0.0015;
+  space.glow.scale.setScalar(DM * (space.stage === 'blackhole' ? 3.2 : 4));
+  space.glow.position.copy(space.manjuBall.position);
+  space.disk.scale.setScalar(DM);
+  space.disk.position.copy(space.manjuBall.position);
+  space.disk.rotation.z += 0.002;
+  space.manjuLabel.sprite.position.set(manjuX, DM + 2.2, 0);
+
+  if (ref) {
+    space.refBall.visible = true;
+    space.refBall.scale.setScalar(DR);
+    space.refBall.position.set(refX, 0, 0);
+    space.refBall.material.color.set(ref.color);
+    space.refBall.material.emissive.set(ref.glow ? ref.color : 0x000000);
+    space.refBall.material.emissiveIntensity = 0.7;
+    space.refGlow.visible = !!ref.glow;
+    space.refGlow.scale.setScalar(DR * 4);
+    space.refGlow.position.copy(space.refBall.position);
+    space.refLabel.sprite.visible = true;
+    space.refLabel.sprite.position.set(refX, DR + 2.2, 0);
+  } else {
+    space.refBall.visible = false;
+    space.refGlow.visible = false;
+    space.refLabel.sprite.visible = false;
+  }
+
+  // ラベルは倍増・天体切替のときだけ描き直す
+  if (space.lastGen !== state.gen || refIdx !== space.refIdx) {
+    space.lastGen = state.gen;
+    if (refIdx !== space.refIdx && space.refIdx >= 0 && refIdx > space.refIdx) {
+      showToast(`${CELESTIAL_REFS[space.refIdx].name}を超えました！`);
+    }
+    space.refIdx = refIdx;
+    const title = stage === 'blackhole' ? 'まんじゅうブラックホール'
+      : stage === 'star' ? 'まんじゅう恒星' : 'まんじゅう惑星';
+    const sub = stage === 'blackhole'
+      ? `半径 ${formatDist(R)}・太陽の${formatSI(mass / SUN_MASS, '')}倍の質量`
+      : `半径 ${formatDist(R)}`;
+    space.manjuLabel.set(title, sub);
+    if (ref) space.refLabel.set(ref.name, `半径 ${formatDist(ref.r)}`);
+  }
+  // カメラ用の表示半径（ブラックホールは降着円盤まで画角に収める）
+  const camRadius = stage === 'blackhole' ? Math.max(DM * 3.4, DM + DR + gap) : DM + DR + gap;
+
+  // ラベルはカメラ距離に合わせて拡大し、ブラックホールでは円盤の上に逃がす
+  const L = Math.max(10, camRadius * 0.75);
+  for (const lbl of [space.manjuLabel, space.refLabel]) {
+    lbl.sprite.scale.set(L, L * 220 / 1024, 1);
+  }
+  space.manjuLabel.sprite.position.y = DM + 2.2 + (stage === 'blackhole' ? DM * 1.6 : 0);
+
+  return camRadius;
+}
+
 // ---------- 栗まんじゅうジオメトリ（上が焼き色・下が生地色の頂点カラー） ----------
 function buildManjuGeometry(wSeg, hSeg) {
   const geo = new THREE.SphereGeometry(MANJU_RADIUS, wSeg, hSeg);
@@ -409,6 +707,7 @@ function resetSim(toast) {
   pile.scale.setScalar(1);
   pile.position.y = 0;
   pile.rotation.y = 0;
+  exitSpace();
   spawnManju(0, MANJU_RADIUS, 0);
   applyLOD();
   $('mode').textContent = '⚙️ 物理演算モード（Rapier）';
@@ -517,6 +816,10 @@ $('speed').addEventListener('input', e => {
 $('resetBtn').addEventListener('click', () => resetSim('リセットしました'));
 $('rocketBtn').addEventListener('click', () => {
   if (state.rocketing) return;
+  if (space.active) {
+    showToast('もう手遅れです。宇宙のどこにも捨て場所がありません…');
+    return;
+  }
   state.rocketing = true;
   state.rocketTimer = 0;
   state.running = false;
@@ -651,8 +954,18 @@ function animate() {
   if (anyWritten) manjuMesh.instanceMatrix.needsUpdate = true;
   basePileRadius = Math.sqrt(maxR2) + MANJU_RADIUS;
 
+  // --- 宇宙モード：天体サイズに達したら惑星→恒星→ブラックホールと姿が変わる ---
+  let spaceRadius = 0;
+  if (frozen && !state.rocketing) {
+    const volNow = bigToNumber(state.count) * MANJU_VOLUME_M3;
+    if (!space.active && volNow >= SPACE_VOL) enterSpace();
+    if (space.active) {
+      spaceRadius = updateSpace(volNow, bigToNumber(state.count) * MANJU_MASS_KG);
+    }
+  }
+
   // --- 上限超過後は「山ごと」体積比で拡大する（描画破綻を避けるため1e7倍まで） ---
-  const targetScale = frozen && !state.rocketing
+  const targetScale = frozen && !state.rocketing && !space.active
     ? Math.cbrt(bigToNumber(state.count) / MAX_PHYS)
     : pile.scale.x;
   if (Number.isFinite(targetScale)) {
@@ -660,8 +973,8 @@ function animate() {
     pile.scale.setScalar(THREE.MathUtils.lerp(pile.scale.x, capped, 1 - Math.pow(0.02, dt)));
   }
 
-  // --- カメラを山の大きさに合わせてスムーズに引く ---
-  const radius = currentRadius();
+  // --- カメラを山（または天体）の大きさに合わせてスムーズに引く ---
+  const radius = space.active ? Math.max(8, spaceRadius) : currentRadius();
   contactShadow.scale.setScalar(Math.max(1, radius * 1.1));
   contactShadow.position.y = Math.max(0.01, radius * 0.005); // 遠景でのZファイティング防止
   ground.scale.setScalar(Math.max(1, radius * 6 / 2000));
@@ -671,11 +984,12 @@ function animate() {
   const curDist = camera.position.distanceTo(controls.target);
   const newDist = THREE.MathUtils.lerp(curDist, targetDist, 1 - Math.pow(0.1, dt));
   camera.position.sub(controls.target).setLength(newDist).add(controls.target);
-  const targetY = state.rocketing && !frozen
-    ? maxY * 0.6                                        // 打ち上げ中は群れを追う
-    : radius * 0.3 + (frozen ? pile.position.y * 0.5 : 0);
+  const targetY = space.active ? 0
+    : state.rocketing && !frozen
+      ? maxY * 0.6                                      // 打ち上げ中は群れを追う
+      : radius * 0.3 + (frozen ? pile.position.y * 0.5 : 0);
   controls.target.lerp(new THREE.Vector3(0, targetY, 0), 1 - Math.pow(0.1, dt));
-  scene.fog.density = 0.012 / Math.max(1, radius / 8);
+  scene.fog.density = space.active ? 1e-6 : 0.012 / Math.max(1, radius / 8);
 
   controls.update();
   renderer.render(scene, camera);
