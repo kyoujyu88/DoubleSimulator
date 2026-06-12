@@ -34,6 +34,7 @@
   .row { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; margin-top: 6px; color: #e8d9bd; }
   .row b { color: #fff; font-weight: 600; text-align: right; }
   #compare { margin-top: 8px; font-size: 13px; color: var(--accent); min-height: 1.4em; }
+  #mode { margin-top: 4px; font-size: 11px; color: #8fd18f; }
   #progressWrap { margin-top: 10px; height: 6px; background: rgba(255,255,255,.12); border-radius: 3px; overflow: hidden; }
   #progress { height: 100%; width: 0%; background: linear-gradient(90deg, #ffb347, #ff6b6b); transition: width .1s linear; }
   #nextLabel { font-size: 11px; color: #b8a888; margin-top: 4px; }
@@ -69,6 +70,14 @@
   @keyframes toastIn { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: none; } }
   @keyframes toastOut { to { opacity: 0; transform: translateY(-12px); } }
 
+  #loading {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: #1a1410; z-index: 100; flex-direction: column; gap: 12px;
+    font-size: 15px; color: var(--accent); letter-spacing: 1px;
+  }
+  #loading .manju { font-size: 48px; animation: bounce 1s ease infinite; }
+  @keyframes bounce { 50% { transform: translateY(-14px) scale(1.05, .95); } }
+
   #footer {
     position: fixed; bottom: 8px; right: 12px; font-size: 10.5px; color: rgba(255,255,255,.35);
   }
@@ -81,13 +90,15 @@
 {
   "imports": {
     "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
-    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/"
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/",
+    "@dimforge/rapier3d-compat": "https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/+esm"
   }
 }
 </script>
 </head>
 <body>
 <div id="app"></div>
+<div id="loading"><div class="manju">🌰</div>物理エンジンを読み込み中…</div>
 
 <div id="hud" class="panel">
   <h1>🌰 バイバイン<small>5分ごとに2倍にふえる</small></h1>
@@ -97,6 +108,7 @@
   <div class="row"><span>総体積</span><b id="volume">80 cm³</b></div>
   <div class="row"><span>総質量</span><b id="mass">50 g</b></div>
   <div id="compare"></div>
+  <div id="mode">⚙️ 物理演算モード（Rapier）</div>
   <div id="progressWrap"><div id="progress"></div></div>
   <div id="nextLabel">次の倍増まで…</div>
 </div>
@@ -109,17 +121,20 @@
 </div>
 
 <div id="toast"></div>
-<div id="footer">ドラッグで回転 / ホイールでズーム</div>
+<div id="footer">ドラッグで回転 / ホイールでズーム / 物理: Rapier</div>
 
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import RAPIER from '@dimforge/rapier3d-compat';
 
 // ---------- 定数 ----------
 const MANJU_RADIUS = 0.5;          // 表示上のまんじゅう半径
 const MANJU_VOLUME_M3 = 80e-6;     // 栗まんじゅう1個 ≈ 80 cm³
 const MANJU_MASS_KG = 0.05;        // 1個 ≈ 50 g
-const MAX_VISIBLE = 8192;          // 個別描画する上限（以降は山ごと拡大）
+// 物理剛体の上限。?phys=4096 のようにURLで変更可（重い端末は512など）
+const MAX_PHYS = Math.min(8192, Math.max(128,
+  Number(new URLSearchParams(location.search).get('phys')) || 2048));
 
 // 体積の比較対象（m³, 小さい順）
 const COMPARISONS = [
@@ -152,6 +167,21 @@ const MILESTONES = [
 // 漢数字の大数単位（4桁ごと）
 const KANJI_UNITS = ['', '万', '億', '兆', '京', '垓', '𥝱', '穣', '溝', '澗',
                      '正', '載', '極', '恒河沙', '阿僧祇', '那由他', '不可思議', '無量大数'];
+
+// ---------- 物理エンジン初期化 ----------
+await RAPIER.init();
+document.getElementById('loading').remove();
+
+const GRAVITY = { x: 0, y: -19.6, z: 0 }; // 少し強めの重力でキビキビ動かす
+let world;
+function createWorld() {
+  world = new RAPIER.World(GRAVITY);
+  // 床
+  world.createCollider(
+    RAPIER.ColliderDesc.cuboid(600, 0.5, 600).setTranslation(0, -0.5, 0).setFriction(0.9)
+  );
+}
+createWorld();
 
 // ---------- シーン ----------
 const container = document.getElementById('app');
@@ -230,7 +260,7 @@ function buildManjuGeometry() {
 const manjuMesh = new THREE.InstancedMesh(
   buildManjuGeometry(),
   new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.65, metalness: 0.02 }),
-  MAX_VISIBLE
+  MAX_PHYS
 );
 manjuMesh.count = 0;
 manjuMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -239,34 +269,66 @@ const pile = new THREE.Group();
 pile.add(manjuMesh);
 scene.add(pile);
 
-// ---------- 山の配置（k番目の位置は不変：決定論的に山型へ詰めていく） ----------
-function hash(k, seed) {
-  let h = Math.imul(k + 1, 2654435761) ^ Math.imul(seed, 40503);
-  h = Math.imul(h ^ (h >>> 13), 2246822519);
-  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
-}
-const SPACING = MANJU_RADIUS * 1.85;
-const positions = []; // Vector3 のキャッシュ
-function pilePosition(k) {
-  if (positions[k]) return positions[k];
-  if (k === 0) {
-    return positions[0] = new THREE.Vector3(0, MANJU_RADIUS * 0.62, 0);
-  }
-  // 内側から外殻へ：球殻半径 ∝ k^(1/3)。方向は半球上＋上下に潰してドーム型に
-  const u = hash(k, 1), v = hash(k, 2), w = hash(k, 3);
-  const rr = Math.cbrt(k + w) * SPACING * 0.8;
-  const theta = u * Math.PI * 2;
-  const y01 = Math.pow(v, 1.7);                 // 下寄りに密集
-  const horiz = Math.sqrt(Math.max(0, 1 - y01 * y01));
-  const p = new THREE.Vector3(
-    Math.cos(theta) * horiz * rr,
-    Math.max(MANJU_RADIUS * 0.62, y01 * rr * 0.55 + MANJU_RADIUS * 0.4),
-    Math.sin(theta) * horiz * rr
+// ---------- 物理ボディ管理 ----------
+// まんじゅう ≈ 押しつぶした円盤＋丸い縁（roundCylinder）。見た目よりわずかに小さくして
+// 接触時に柔らかく重なって見えるようにする
+const COLLIDER = { halfHeight: 0.10, radius: 0.30, border: 0.16 };
+const bodies = [];      // RAPIER.RigidBody（描画インデックスと1対1）
+const spawnTimes = [];  // 出現アニメーション用タイムスタンプ
+
+function spawnManju(x, y, z, vel) {
+  const desc = RAPIER.RigidBodyDesc.dynamic()
+    .setTranslation(x, y, z)
+    .setRotation(randomQuat())
+    .setLinearDamping(0.25)
+    .setAngularDamping(0.7);
+  if (vel) desc.setLinvel(vel.x, vel.y, vel.z);
+  const body = world.createRigidBody(desc);
+  world.createCollider(
+    RAPIER.ColliderDesc.roundCylinder(COLLIDER.halfHeight, COLLIDER.radius, COLLIDER.border)
+      .setFriction(0.85)
+      .setRestitution(0.12)
+      .setDensity(1.0),
+    body
   );
-  return positions[k] = p;
+  bodies.push(body);
+  spawnTimes.push(performance.now());
+  manjuMesh.count = bodies.length;
 }
-function pileRadiusFor(visible) {
-  return Math.max(1, Math.cbrt(visible) * SPACING * 0.8 + MANJU_RADIUS);
+
+const _q = new THREE.Quaternion();
+const _e = new THREE.Euler();
+function randomQuat() {
+  _e.set((Math.random() - 0.5) * 0.6, Math.random() * Math.PI * 2, (Math.random() - 0.5) * 0.6);
+  _q.setFromEuler(_e);
+  return { x: _q.x, y: _q.y, z: _q.z, w: _q.w };
+}
+
+// 倍増：既存のまんじゅう1個ずつの真上に分身を生む（上限まで）
+function doublePhysical() {
+  const n = bodies.length;
+  for (let k = 0; k < n; k++) {
+    if (bodies.length >= MAX_PHYS) break;
+    const p = bodies[k].translation();
+    const a = Math.random() * Math.PI * 2;
+    const r = 0.15 + Math.random() * 0.2;
+    spawnManju(
+      p.x + Math.cos(a) * r,
+      p.y + 0.65 + Math.random() * 0.25,
+      p.z + Math.sin(a) * r,
+      { x: Math.cos(a) * 0.5, y: 0.5 + Math.random(), z: Math.sin(a) * 0.5 }
+    );
+    bodies[k].wakeUp();
+  }
+}
+
+// 物理上限を超えたら全ボディを固定して「山ごと拡大」モードへ
+let frozen = false;
+function freezeAll() {
+  frozen = true;
+  for (const b of bodies) b.setBodyType(RAPIER.RigidBodyType.Fixed, false);
+  $('mode').textContent = `🗻 拡大表示モード（物理 ${MAX_PHYS.toLocaleString()}個 + 山ごとスケール）`;
+  showToast(`物理演算は${MAX_PHYS.toLocaleString()}個まで！ここからは山ごと拡大します`);
 }
 
 // ---------- 状態 ----------
@@ -278,52 +340,37 @@ const state = {
   timer: 0,
   milestoneIdx: 0,
   rocketing: false,
+  rocketTimer: 0,
 };
-const spawnAnims = []; // { index, t } 出現アニメーション
-
-function visibleTarget() {
-  return state.count > BigInt(MAX_VISIBLE) ? MAX_VISIBLE : Number(state.count);
-}
-
-const dummy = new THREE.Object3D();
-function setInstance(i, scale) {
-  const p = pilePosition(i);
-  dummy.position.copy(p);
-  const r1 = hash(i, 7), r2 = hash(i, 8);
-  dummy.rotation.set((r1 - 0.5) * 0.5, r2 * Math.PI * 2, (hash(i, 9) - 0.5) * 0.5);
-  dummy.scale.setScalar(scale);
-  dummy.updateMatrix();
-  manjuMesh.setMatrixAt(i, dummy.matrix);
-}
 
 function doubleNow() {
-  const before = visibleTarget();
   state.count *= 2n;
   state.gen += 1;
-  const after = visibleTarget();
-  for (let i = before; i < after; i++) {
-    setInstance(i, 0.001);
-    spawnAnims.push({ index: i, t: -Math.min(0.4, (i - before) / Math.max(1, after - before) * 0.4) });
+  if (!frozen) {
+    doublePhysical();
+    if (state.count > BigInt(MAX_PHYS)) freezeAll();
   }
-  manjuMesh.count = after;
-  manjuMesh.instanceMatrix.needsUpdate = true;
   checkMilestones();
   updateHUD();
 }
 
 function resetSim(toast) {
+  world.free();
+  createWorld();
+  bodies.length = 0;
+  spawnTimes.length = 0;
+  frozen = false;
   state.count = 1n;
   state.gen = 0;
   state.timer = 0;
   state.milestoneIdx = 0;
-  spawnAnims.length = 0;
-  manjuMesh.count = 1;
-  setInstance(0, 1);
-  manjuMesh.instanceMatrix.needsUpdate = true;
+  state.rocketing = false;
+  state.rocketTimer = 0;
   pile.scale.setScalar(1);
   pile.position.y = 0;
-  pile.visible = true;
-  state.rocketing = false;
+  pile.rotation.y = 0;
+  spawnManju(0, MANJU_RADIUS, 0);
+  $('mode').textContent = '⚙️ 物理演算モード（Rapier）';
   if (toast) showToast(toast);
   updateHUD();
 }
@@ -430,9 +477,27 @@ $('resetBtn').addEventListener('click', () => resetSim('リセットしました
 $('rocketBtn').addEventListener('click', () => {
   if (state.rocketing) return;
   state.rocketing = true;
+  state.rocketTimer = 0;
   state.running = false;
   $('playBtn').textContent = '▶ 再開';
-  showToast('🚀 まんじゅうの山を宇宙へ……');
+  showToast('🚀 まんじゅうを宇宙へ……');
+  if (!frozen) {
+    // 全まんじゅうに打ち上げの力を与え、重力も反転
+    world.gravity.y = 18;
+    for (const b of bodies) {
+      const m = b.mass();
+      b.applyImpulse({
+        x: (Math.random() - 0.5) * 6 * m,
+        y: (16 + Math.random() * 14) * m,
+        z: (Math.random() - 0.5) * 6 * m,
+      }, true);
+      b.applyTorqueImpulse({
+        x: (Math.random() - 0.5) * 0.4 * m,
+        y: (Math.random() - 0.5) * 0.4 * m,
+        z: (Math.random() - 0.5) * 0.4 * m,
+      }, true);
+    }
+  }
 });
 
 addEventListener('resize', () => {
@@ -444,23 +509,26 @@ addEventListener('resize', () => {
 // ---------- メインループ ----------
 let rocketVel = 0;
 const clock = new THREE.Clock();
+const dummy = new THREE.Object3D();
+const PHYS_DT = 1 / 60;
+let physAccum = 0;
 
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.1);
 
+  // --- 進行管理 ---
   if (state.rocketing) {
-    // 山ごと宇宙へ打ち上げ → 見えなくなったらリセット
-    const r = pileRadiusFor(visibleTarget()) * pile.scale.x;
-    rocketVel += dt * 60 * Math.max(1, r / 6);
-    pile.position.y += rocketVel * dt;
-    pile.rotation.y += dt * 2;
-    if (pile.position.y > Math.max(400, r * 40)) {
-      rocketVel = 0;
-      pile.rotation.y = 0;
-      resetSim('ひと安心。…でも宇宙のどこかで増え続けています');
-      state.running = true;
-      $('playBtn').textContent = '⏸ 一時停止';
+    state.rocketTimer += dt;
+    if (frozen) {
+      // 固定済みの山は丸ごと打ち上げる
+      const r = currentRadius();
+      rocketVel += dt * 60 * Math.max(1, r / 6);
+      pile.position.y += rocketVel * dt;
+      pile.rotation.y += dt * 2;
+      if (pile.position.y > Math.max(400, r * 40)) finishRocket();
+    } else if (state.rocketTimer > 5) {
+      finishRocket();
     }
   } else if (state.running) {
     state.timer += dt;
@@ -471,30 +539,47 @@ function animate() {
   }
   $('progress').style.width = `${Math.min(100, state.timer / state.interval * 100)}%`;
 
-  // 出現アニメーション（ぽよんと膨らむ）
-  for (let i = spawnAnims.length - 1; i >= 0; i--) {
-    const a = spawnAnims[i];
-    a.t += dt * 2.2;
-    if (a.t < 0) continue;
-    const t = Math.min(a.t, 1);
-    const s = t < 0.7 ? (t / 0.7) * 1.18 : 1.18 - (t - 0.7) / 0.3 * 0.18; // overshoot
-    setInstance(a.index, Math.max(0.001, s));
-    if (t >= 1) spawnAnims.splice(i, 1);
+  // --- 物理ステップ（固定タイムステップ・最大3サブステップ） ---
+  if (!frozen) {
+    physAccum = Math.min(physAccum + dt, PHYS_DT * 3);
+    while (physAccum >= PHYS_DT) {
+      world.step();
+      physAccum -= PHYS_DT;
+    }
   }
-  if (spawnAnims.length) manjuMesh.instanceMatrix.needsUpdate = true;
 
-  // 上限超過後は「山ごと」体積比で拡大する（描画破綻を避けるため拡大は1e7倍まで）
-  const targetScale = state.count > BigInt(MAX_VISIBLE)
-    ? Math.cbrt(bigToNumber(state.count) / MAX_VISIBLE)
-    : 1;
+  // --- 物理ボディ → 描画行列の同期（山の半径も同時に計測） ---
+  const now = performance.now();
+  let maxR2 = 1, maxY = 0;
+  for (let i = 0; i < bodies.length; i++) {
+    const p = bodies[i].translation();
+    const q = bodies[i].rotation();
+    dummy.position.set(p.x, p.y, p.z);
+    dummy.quaternion.set(q.x, q.y, q.z, q.w);
+    const t = Math.min(1, (now - spawnTimes[i]) / 280);
+    const s = t < 0.75 ? 0.2 + (t / 0.75) * 0.95 : 1.15 - (t - 0.75) / 0.25 * 0.15; // ぽよん
+    dummy.scale.setScalar(s);
+    dummy.updateMatrix();
+    manjuMesh.setMatrixAt(i, dummy.matrix);
+    const r2 = p.x * p.x + p.z * p.z + p.y * p.y * 0.5;
+    if (r2 > maxR2) maxR2 = r2;
+    if (p.y > maxY) maxY = p.y;
+  }
+  manjuMesh.instanceMatrix.needsUpdate = true;
+  basePileRadius = Math.sqrt(maxR2) + MANJU_RADIUS;
+
+  // --- 上限超過後は「山ごと」体積比で拡大する（描画破綻を避けるため1e7倍まで） ---
+  const targetScale = frozen && !state.rocketing
+    ? Math.cbrt(bigToNumber(state.count) / MAX_PHYS)
+    : pile.scale.x;
   if (Number.isFinite(targetScale)) {
-    const capped = Math.min(targetScale, 1e7);
+    const capped = Math.min(Math.max(1, targetScale), 1e7);
     pile.scale.setScalar(THREE.MathUtils.lerp(pile.scale.x, capped, 1 - Math.pow(0.02, dt)));
   }
 
-  // カメラを山の大きさに合わせてスムーズに引く
-  const radius = pileRadiusFor(visibleTarget()) * pile.scale.x;
-  contactShadow.scale.setScalar(radius * 1.15);
+  // --- カメラを山の大きさに合わせてスムーズに引く ---
+  const radius = currentRadius();
+  contactShadow.scale.setScalar(Math.max(1, radius * 1.1));
   ground.scale.setScalar(Math.max(1, radius * 6 / 2000));
   const targetDist = Math.max(9, radius * 3.1);
   camera.far = Math.max(5000, targetDist * 20);
@@ -502,14 +587,30 @@ function animate() {
   const curDist = camera.position.distanceTo(controls.target);
   const newDist = THREE.MathUtils.lerp(curDist, targetDist, 1 - Math.pow(0.1, dt));
   camera.position.sub(controls.target).setLength(newDist).add(controls.target);
-  controls.target.lerp(new THREE.Vector3(0, radius * 0.35 + pile.position.y * 0.5, 0), 1 - Math.pow(0.1, dt));
+  const targetY = state.rocketing && !frozen
+    ? maxY * 0.6                                        // 打ち上げ中は群れを追う
+    : radius * 0.3 + (frozen ? pile.position.y * 0.5 : 0);
+  controls.target.lerp(new THREE.Vector3(0, targetY, 0), 1 - Math.pow(0.1, dt));
   scene.fog.density = 0.012 / Math.max(1, radius / 8);
 
   controls.update();
   renderer.render(scene, camera);
 }
 
+let basePileRadius = 1;
+function currentRadius() {
+  return Math.max(2, basePileRadius) * pile.scale.x;
+}
+
+function finishRocket() {
+  rocketVel = 0;
+  resetSim('ひと安心。…でも宇宙のどこかで増え続けています');
+  state.running = true;
+  $('playBtn').textContent = '⏸ 一時停止';
+}
+
 resetSim();
+updateHUD();
 animate();
 </script>
 </body>
