@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>バイバイン シミュレーター</title>
+<title>まんじゅう倍々シミュレーター</title>
 <style>
   :root {
     --panel-bg: rgba(20, 16, 12, 0.78);
@@ -101,12 +101,13 @@
 <div id="loading"><div class="manju">🌰</div>物理エンジンを読み込み中…</div>
 
 <div id="hud" class="panel">
-  <h1>🌰 バイバイン<small>5分ごとに2倍にふえる</small></h1>
+  <h1>🌰 まんじゅう倍々シミュレーター<small>5分ごとに2倍</small></h1>
   <div id="count">1 <span class="unit">個</span></div>
   <div class="row"><span>倍増回数</span><b id="gen">0 回</b></div>
-  <div class="row"><span>作中経過時間（5分/回）</span><b id="storyTime">0 分</b></div>
+  <div class="row"><span>経過時間（1回=5分 換算）</span><b id="storyTime">0 分</b></div>
   <div class="row"><span>総体積</span><b id="volume">80 cm³</b></div>
   <div class="row"><span>総質量</span><b id="mass">50 g</b></div>
+  <div class="row"><span>剛体 / FPS</span><b id="perf">1個 / -</b></div>
   <div id="compare"></div>
   <div id="mode">⚙️ 物理演算モード（Rapier）</div>
   <div id="progressWrap"><div id="progress"></div></div>
@@ -132,9 +133,11 @@ import RAPIER from '@dimforge/rapier3d-compat';
 const MANJU_RADIUS = 0.5;          // 表示上のまんじゅう半径
 const MANJU_VOLUME_M3 = 80e-6;     // 栗まんじゅう1個 ≈ 80 cm³
 const MANJU_MASS_KG = 0.05;        // 1個 ≈ 50 g
-// 物理剛体の上限。?phys=4096 のようにURLで変更可（重い端末は512など）
+// 物理剛体の上限。?phys=8192 のようにURLで変更可（重い端末は512など）
 const MAX_PHYS = Math.min(8192, Math.max(128,
-  Number(new URLSearchParams(location.search).get('phys')) || 2048));
+  Number(new URLSearchParams(location.search).get('phys')) || 4096));
+// これだけ静止し続けた剛体は固定ボディ化（石化）してソルバーから外す
+const PETRIFY_MS = 3000;
 
 // 体積の比較対象（m³, 小さい順）
 const COMPARISONS = [
@@ -240,8 +243,8 @@ contactShadow.position.y = 0.01;
 scene.add(contactShadow);
 
 // ---------- 栗まんじゅうジオメトリ（上が焼き色・下が生地色の頂点カラー） ----------
-function buildManjuGeometry() {
-  const geo = new THREE.SphereGeometry(MANJU_RADIUS, 24, 18);
+function buildManjuGeometry(wSeg, hSeg) {
+  const geo = new THREE.SphereGeometry(MANJU_RADIUS, wSeg, hSeg);
   geo.scale(1, 0.62, 1);
   const posAttr = geo.attributes.position;
   const colors = new Float32Array(posAttr.count * 3);
@@ -257,8 +260,24 @@ function buildManjuGeometry() {
   return geo;
 }
 
+// 個数に応じて描画ポリゴン数を落とす（物理コライダーは解析形状なので影響なし）
+const GEO_LODS = [
+  { upTo: 512,      geo: buildManjuGeometry(24, 18) },
+  { upTo: 2048,     geo: buildManjuGeometry(14, 10) },
+  { upTo: Infinity, geo: buildManjuGeometry(8, 6) },
+];
+let lodIdx = 0;
+function applyLOD() {
+  let idx = 0;
+  while (bodies.length > GEO_LODS[idx].upTo) idx++;
+  if (idx !== lodIdx) {
+    lodIdx = idx;
+    manjuMesh.geometry = GEO_LODS[idx].geo;
+  }
+}
+
 const manjuMesh = new THREE.InstancedMesh(
-  buildManjuGeometry(),
+  GEO_LODS[0].geo,
   new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.65, metalness: 0.02 }),
   MAX_PHYS
 );
@@ -275,6 +294,11 @@ scene.add(pile);
 const COLLIDER = { halfHeight: 0.10, radius: 0.30, border: 0.16 };
 const bodies = [];      // RAPIER.RigidBody（描画インデックスと1対1）
 const spawnTimes = [];  // 出現アニメーション用タイムスタンプ
+const sleepSince = [];  // 静止し始めた時刻（0=動いている）
+const petrified = [];   // 石化（固定ボディ化）済みフラグ
+const matrixClean = []; // 描画行列が最新で書き直し不要
+let petrifiedCount = 0;
+let staticMaxR2 = 1, staticMaxY = 0; // 静止済みボディが占める範囲（毎フレーム再計算しない）
 
 function spawnManju(x, y, z, vel) {
   const desc = RAPIER.RigidBodyDesc.dynamic()
@@ -293,6 +317,9 @@ function spawnManju(x, y, z, vel) {
   );
   bodies.push(body);
   spawnTimes.push(performance.now());
+  sleepSince.push(0);
+  petrified.push(false);
+  matrixClean.push(false);
   manjuMesh.count = bodies.length;
 }
 
@@ -318,15 +345,22 @@ function doublePhysical() {
       p.z + Math.sin(a) * r,
       { x: Math.cos(a) * 0.5, y: 0.5 + Math.random(), z: Math.sin(a) * 0.5 }
     );
-    bodies[k].wakeUp();
+    if (!petrified[k]) bodies[k].wakeUp();
   }
+  applyLOD();
 }
 
 // 物理上限を超えたら全ボディを固定して「山ごと拡大」モードへ
 let frozen = false;
 function freezeAll() {
   frozen = true;
-  for (const b of bodies) b.setBodyType(RAPIER.RigidBodyType.Fixed, false);
+  for (let i = 0; i < bodies.length; i++) {
+    if (!petrified[i]) {
+      bodies[i].setBodyType(RAPIER.RigidBodyType.Fixed, false);
+      petrified[i] = true;
+      petrifiedCount++;
+    }
+  }
   $('mode').textContent = `🗻 拡大表示モード（物理 ${MAX_PHYS.toLocaleString()}個 + 山ごとスケール）`;
   showToast(`物理演算は${MAX_PHYS.toLocaleString()}個まで！ここからは山ごと拡大します`);
 }
@@ -359,6 +393,12 @@ function resetSim(toast) {
   createWorld();
   bodies.length = 0;
   spawnTimes.length = 0;
+  sleepSince.length = 0;
+  petrified.length = 0;
+  matrixClean.length = 0;
+  petrifiedCount = 0;
+  staticMaxR2 = 1;
+  staticMaxY = 0;
   frozen = false;
   state.count = 1n;
   state.gen = 0;
@@ -370,6 +410,7 @@ function resetSim(toast) {
   pile.position.y = 0;
   pile.rotation.y = 0;
   spawnManju(0, MANJU_RADIUS, 0);
+  applyLOD();
   $('mode').textContent = '⚙️ 物理演算モード（Rapier）';
   if (toast) showToast(toast);
   updateHUD();
@@ -482,7 +523,18 @@ $('rocketBtn').addEventListener('click', () => {
   $('playBtn').textContent = '▶ 再開';
   showToast('🚀 まんじゅうを宇宙へ……');
   if (!frozen) {
-    // 全まんじゅうに打ち上げの力を与え、重力も反転
+    // 石化済みのまんじゅうを動的に戻してから、全部に打ち上げの力を与える
+    for (let i = 0; i < bodies.length; i++) {
+      if (petrified[i]) {
+        bodies[i].setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+        petrified[i] = false;
+      }
+      sleepSince[i] = 0;
+      matrixClean[i] = false;
+    }
+    petrifiedCount = 0;
+    staticMaxR2 = 1;
+    staticMaxY = 0;
     world.gravity.y = 18;
     for (const b of bodies) {
       const m = b.mass();
@@ -549,9 +601,32 @@ function animate() {
   }
 
   // --- 物理ボディ → 描画行列の同期（山の半径も同時に計測） ---
+  // 静止している剛体はスキップ。さらに PETRIFY_MS 以上静止したら固定ボディ化して
+  // ソルバーからも外す（山の内部・下層は二度と動かないため）
   const now = performance.now();
-  let maxR2 = 1, maxY = 0;
+  let maxR2 = staticMaxR2, maxY = staticMaxY;
+  let anyWritten = false;
   for (let i = 0; i < bodies.length; i++) {
+    const isStatic = petrified[i] || bodies[i].isSleeping();
+    if (!frozen && !petrified[i]) {
+      // スリープ済み、またはほぼ静止（|v|<0.1）が PETRIFY_MS 続いたら石化
+      let quiet = isStatic;
+      if (!quiet) {
+        const lv = bodies[i].linvel();
+        quiet = lv.x * lv.x + lv.y * lv.y + lv.z * lv.z < 0.01;
+      }
+      if (quiet) {
+        if (!sleepSince[i]) sleepSince[i] = now;
+        else if (now - sleepSince[i] > PETRIFY_MS) {
+          bodies[i].setBodyType(RAPIER.RigidBodyType.Fixed, false);
+          petrified[i] = true;
+          petrifiedCount++;
+        }
+      } else {
+        sleepSince[i] = 0;
+      }
+    }
+    if (matrixClean[i] && isStatic) continue;
     const p = bodies[i].translation();
     const q = bodies[i].rotation();
     dummy.position.set(p.x, p.y, p.z);
@@ -561,11 +636,19 @@ function animate() {
     dummy.scale.setScalar(s);
     dummy.updateMatrix();
     manjuMesh.setMatrixAt(i, dummy.matrix);
+    anyWritten = true;
     const r2 = p.x * p.x + p.z * p.z + p.y * p.y * 0.5;
     if (r2 > maxR2) maxR2 = r2;
     if (p.y > maxY) maxY = p.y;
+    if (isStatic && t >= 1) {
+      matrixClean[i] = true; // 静止確定 → 以降は書き直さず、範囲もキャッシュに畳み込む
+      if (r2 > staticMaxR2) staticMaxR2 = r2;
+      if (p.y > staticMaxY) staticMaxY = p.y;
+    } else {
+      matrixClean[i] = false;
+    }
   }
-  manjuMesh.instanceMatrix.needsUpdate = true;
+  if (anyWritten) manjuMesh.instanceMatrix.needsUpdate = true;
   basePileRadius = Math.sqrt(maxR2) + MANJU_RADIUS;
 
   // --- 上限超過後は「山ごと」体積比で拡大する（描画破綻を避けるため1e7倍まで） ---
@@ -580,6 +663,7 @@ function animate() {
   // --- カメラを山の大きさに合わせてスムーズに引く ---
   const radius = currentRadius();
   contactShadow.scale.setScalar(Math.max(1, radius * 1.1));
+  contactShadow.position.y = Math.max(0.01, radius * 0.005); // 遠景でのZファイティング防止
   ground.scale.setScalar(Math.max(1, radius * 6 / 2000));
   const targetDist = Math.max(9, radius * 3.1);
   camera.far = Math.max(5000, targetDist * 20);
@@ -595,7 +679,18 @@ function animate() {
 
   controls.update();
   renderer.render(scene, camera);
+
+  // --- パフォーマンス表示（0.5秒ごと） ---
+  fpsFrames++;
+  if (now - fpsLast > 500) {
+    const fps = Math.round(fpsFrames * 1000 / (now - fpsLast));
+    const active = bodies.length - petrifiedCount;
+    $('perf').textContent = `${bodies.length.toLocaleString()}個（可動 ${active.toLocaleString()}） / ${fps} FPS`;
+    fpsFrames = 0;
+    fpsLast = now;
+  }
 }
+let fpsFrames = 0, fpsLast = performance.now();
 
 let basePileRadius = 1;
 function currentRadius() {
