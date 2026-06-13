@@ -137,7 +137,9 @@ const MANJU_MASS_KG = 0.05;        // 1個 ≈ 50 g
 const MAX_PHYS = Math.min(8192, Math.max(128,
   Number(new URLSearchParams(location.search).get('phys')) || 4096));
 // これだけ静止し続けた剛体は固定ボディ化（石化）してソルバーから外す
-const PETRIFY_MS = 3000;
+const PETRIFY_MS = 550;
+// 上限到達後、倍増のたびに埋もれたまんじゅうを上空へリサイクルして降らせる数
+const RECYCLE_BATCH = 80;
 
 // 体積の比較対象（m³, 小さい順）
 const COMPARISONS = [
@@ -650,8 +652,9 @@ function updateGroundRef(vol) {
   ref.model.scale.setScalar(sceneH);
   const x = sceneR * 1.18 + sceneH * ref.w * 0.9;
   groundRefHolder.position.set(x, 0, 0);
-  // 富士山のような幅広・大型の比較対象はカメラを引いて両方画角に収める
-  groundRef.camRadius = (x + sceneH * ref.w) / 1.6;
+  // 比較対象の横幅・高さの両方が画角に入るようカメラ距離を決める
+  // （東京タワーのように背が高いものが上で見切れないように）
+  groundRef.camRadius = Math.max((x + sceneH * ref.w) / 1.6, sceneH * 0.62);
   const L = THREE.MathUtils.clamp(sceneH * 1.2, 1.5, sceneR * 2.2);
   groundRefLabel.sprite.scale.set(L, L * 220 / 1024, 1);
   groundRefLabel.sprite.position.set(0, sceneH * 1.06 + L * 0.18, 0);
@@ -714,6 +717,7 @@ const petrified = [];   // 石化（固定ボディ化）済みフラグ
 const matrixClean = []; // 描画行列が最新で書き直し不要
 let petrifiedCount = 0;
 let staticMaxR2 = 1, staticMaxY = 0; // 静止済みボディが占める範囲（毎フレーム再計算しない）
+let pileTopY = MANJU_RADIUS;          // 山の頂上の高さ（降り注ぎの投下高さに使う）
 
 function spawnManju(x, y, z, vel) {
   const desc = RAPIER.RigidBodyDesc.dynamic()
@@ -746,7 +750,9 @@ function randomQuat() {
   return { x: _q.x, y: _q.y, z: _q.z, w: _q.w };
 }
 
-// 倍増：既存のまんじゅう1個ずつの真上に分身を生む（上限まで）
+// 倍増：既存のまんじゅう1個ずつの真上に分身を生む（上限まで）。
+// 落ちてきた分身が接触すれば Rapier が自動で周囲を起こすので、
+// 全体を wakeUp する必要はない（それをやると永久に石化できなくなる）。
 function doublePhysical() {
   const n = bodies.length;
   for (let k = 0; k < n; k++) {
@@ -760,24 +766,45 @@ function doublePhysical() {
       p.z + Math.sin(a) * r,
       { x: Math.cos(a) * 0.5, y: 0.5 + Math.random(), z: Math.sin(a) * 0.5 }
     );
-    if (!petrified[k]) bodies[k].wakeUp();
   }
   applyLOD();
 }
 
-// 物理上限を超えたら全ボディを固定して「山ごと拡大」モードへ
-let frozen = false;
-function freezeAll() {
-  frozen = true;
-  for (let i = 0; i < bodies.length; i++) {
-    if (!petrified[i]) {
-      bodies[i].setBodyType(RAPIER.RigidBodyType.Fixed, false);
-      petrified[i] = true;
-      petrifiedCount++;
-    }
+// 上限到達後の倍増演出：埋もれた（石化済みの）まんじゅうを一掴み取り出し、
+// 山の上空へワープさせて降らせる。総数は変わらないが「増え続けて降り積もる」
+// 様子が見え、山全体のスケールアップと相まって増加感が持続する。
+function pourRecycle() {
+  const batch = Math.min(petrifiedCount, RECYCLE_BATCH);
+  if (batch <= 0) return;
+  const R = Math.max(0.6, basePileRadius * 0.72);
+  const now = performance.now();
+  let moved = 0;
+  for (let i = 0; i < bodies.length && moved < batch; i++) {
+    if (!petrified[i]) continue;
+    bodies[i].setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+    petrified[i] = false;
+    petrifiedCount--;
+    const a = Math.random() * Math.PI * 2;
+    const rr = Math.sqrt(Math.random()) * R;
+    bodies[i].setTranslation(
+      { x: Math.cos(a) * rr, y: pileTopY + 2.5 + moved * 0.06 + Math.random() * 2, z: Math.sin(a) * rr },
+      true
+    );
+    bodies[i].setLinvel({ x: 0, y: -2, z: 0 }, true);
+    bodies[i].setAngvel({ x: (Math.random() - 0.5) * 2, y: (Math.random() - 0.5) * 2, z: (Math.random() - 0.5) * 2 }, true);
+    sleepSince[i] = 0;
+    matrixClean[i] = false;
+    spawnTimes[i] = now; // 出現アニメをやり直してポンと現れる
+    moved++;
   }
-  $('mode').textContent = `🗻 拡大表示モード（物理 ${MAX_PHYS.toLocaleString()}個 + 山ごとスケール）`;
-  showToast(`物理演算は${MAX_PHYS.toLocaleString()}個まで！ここからは山ごと拡大します`);
+}
+
+// 物理上限に到達したら拡大＋降り注ぎモードへ
+let frozen = false;
+function enterCappedMode() {
+  frozen = true;
+  $('mode').textContent = `🗻 拡大＋降り注ぎモード（物理 ${MAX_PHYS.toLocaleString()}個）`;
+  showToast(`物理は${MAX_PHYS.toLocaleString()}個まで。あとは降らせながら山ごと拡大！`);
 }
 
 // ---------- 状態 ----------
@@ -795,9 +822,13 @@ const state = {
 function doubleNow() {
   state.count *= 2n;
   state.gen += 1;
-  if (!frozen) {
-    doublePhysical();
-    if (state.count > BigInt(MAX_PHYS)) freezeAll();
+  if (!space.active) {
+    if (!frozen) {
+      doublePhysical();
+      if (bodies.length >= MAX_PHYS) enterCappedMode();
+    } else {
+      pourRecycle(); // 上限後も降り注ぎを続けて増加感を出す
+    }
   }
   checkMilestones();
   updateHUD();
@@ -814,6 +845,7 @@ function resetSim(toast) {
   petrifiedCount = 0;
   staticMaxR2 = 1;
   staticMaxY = 0;
+  pileTopY = MANJU_RADIUS;
   frozen = false;
   state.count = 1n;
   state.gen = 0;
@@ -1015,12 +1047,17 @@ function animate() {
   $('progress').style.width = `${Math.min(100, state.timer / state.interval * 100)}%`;
 
   // --- 物理ステップ（固定タイムステップ・最大3サブステップ） ---
-  if (!frozen) {
+  // 動いている（=石化していない）剛体がある時だけ計算する。落ちたまんじゅうが
+  // 積もって全部石化すれば自動的にステップが止まり、巨大な山でも負荷が消える。
+  const activeBodies = bodies.length - petrifiedCount;
+  if (!space.active && !(frozen && state.rocketing) && activeBodies > 0) {
     physAccum = Math.min(physAccum + dt, PHYS_DT * 3);
     while (physAccum >= PHYS_DT) {
       world.step();
       physAccum -= PHYS_DT;
     }
+  } else {
+    physAccum = 0;
   }
 
   // --- 物理ボディ → 描画行列の同期（山の半径も同時に計測） ---
@@ -1031,22 +1068,25 @@ function animate() {
   let anyWritten = false;
   for (let i = 0; i < bodies.length; i++) {
     const isStatic = petrified[i] || bodies[i].isSleeping();
-    if (!frozen && !petrified[i]) {
-      // スリープ済み、またはほぼ静止（|v|<0.1）が PETRIFY_MS 続いたら石化
-      let quiet = isStatic;
-      if (!quiet) {
-        const lv = bodies[i].linvel();
-        quiet = lv.x * lv.x + lv.y * lv.y + lv.z * lv.z < 0.01;
-      }
-      if (quiet) {
-        if (!sleepSince[i]) sleepSince[i] = now;
-        else if (now - sleepSince[i] > PETRIFY_MS) {
-          bodies[i].setBodyType(RAPIER.RigidBodyType.Fixed, false);
-          petrified[i] = true;
-          petrifiedCount++;
-        }
+    if (!petrified[i]) {
+      // Rapierがスリープ判定したら即石化。そうでなくても、ほぼ静止（|v|<0.18）が
+      // PETRIFY_MS 続けば石化してソルバーから外す。
+      if (bodies[i].isSleeping()) {
+        bodies[i].setBodyType(RAPIER.RigidBodyType.Fixed, false);
+        petrified[i] = true;
+        petrifiedCount++;
       } else {
-        sleepSince[i] = 0;
+        const lv = bodies[i].linvel();
+        if (lv.x * lv.x + lv.y * lv.y + lv.z * lv.z < 0.032) {
+          if (!sleepSince[i]) sleepSince[i] = now;
+          else if (now - sleepSince[i] > PETRIFY_MS) {
+            bodies[i].setBodyType(RAPIER.RigidBodyType.Fixed, false);
+            petrified[i] = true;
+            petrifiedCount++;
+          }
+        } else {
+          sleepSince[i] = 0;
+        }
       }
     }
     if (matrixClean[i] && isStatic) continue;
@@ -1073,6 +1113,7 @@ function animate() {
   }
   if (anyWritten) manjuMesh.instanceMatrix.needsUpdate = true;
   basePileRadius = Math.sqrt(maxR2) + MANJU_RADIUS;
+  pileTopY = maxY;
 
   // --- 宇宙モード：天体サイズに達したら惑星→恒星→ブラックホールと姿が変わる ---
   let spaceRadius = 0;
