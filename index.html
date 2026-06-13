@@ -540,6 +540,123 @@ function updateSpace(vol, mass) {
   return camRadius;
 }
 
+// ---------- 地上の比較対象（山が固まってから宇宙に行くまでの間も絵が変わる） ----------
+// 高さ1に正規化した簡易モデルを、山の実寸に合わせた縮尺で隣に立てる
+const refMat = (c, e) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.85, emissive: e ?? 0x000000 });
+
+function buildHumanModel() {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.13, 0.55, 4, 12), refMat(0x3a5a8a));
+  body.position.y = 0.45;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.12, 16, 12), refMat(0xe8c49a));
+  head.position.y = 0.88;
+  g.add(body, head);
+  return g;
+}
+function buildHouseModel() {
+  const g = new THREE.Group();
+  const wall = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.55, 0.7), refMat(0xd8cdb8));
+  wall.position.y = 0.275;
+  const roof = new THREE.Mesh(new THREE.ConeGeometry(0.68, 0.45, 4), refMat(0x8a4a3a));
+  roof.position.y = 0.775;
+  roof.rotation.y = Math.PI / 4;
+  g.add(wall, roof);
+  return g;
+}
+function buildBuildingModel() {
+  const g = new THREE.Group();
+  const tower = new THREE.Mesh(new THREE.BoxGeometry(0.28, 1, 0.28), refMat(0x9aa4b0, 0x182838));
+  tower.position.y = 0.5;
+  g.add(tower);
+  return g;
+}
+function buildTokyoTowerModel() {
+  const g = new THREE.Group();
+  const cone = new THREE.Mesh(new THREE.ConeGeometry(0.3, 0.94, 8), refMat(0xe85d3a));
+  cone.position.y = 0.47;
+  const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.12, 6), refMat(0xffffff));
+  antenna.position.y = 0.97;
+  g.add(cone, antenna);
+  return g;
+}
+function buildSkytreeModel() {
+  const g = new THREE.Group();
+  const cone = new THREE.Mesh(new THREE.ConeGeometry(0.13, 0.9, 6), refMat(0xdfe8ee));
+  cone.position.y = 0.45;
+  const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.14, 6), refMat(0xb8c4cc));
+  antenna.position.y = 0.96;
+  g.add(cone, antenna);
+  return g;
+}
+function buildFujiModel() {
+  const g = new THREE.Group();
+  const mountain = new THREE.Mesh(new THREE.ConeGeometry(2.6, 0.96, 32), refMat(0x5a6a8a));
+  mountain.position.y = 0.48;
+  const snow = new THREE.Mesh(new THREE.ConeGeometry(0.75, 0.3, 32), refMat(0xf0f4f8));
+  snow.position.y = 0.84;
+  g.add(mountain, snow);
+  return g;
+}
+
+const GROUND_REFS = [ // h: 実高さ[m], w: 正規化時の半幅（山と離す距離用）
+  { h: 1.7,  w: 0.2,  name: '人',               model: buildHumanModel() },
+  { h: 8,    w: 0.7,  name: '一軒家',           model: buildHouseModel() },
+  { h: 60,   w: 0.3,  name: 'ビル',             model: buildBuildingModel() },
+  { h: 333,  w: 0.35, name: '東京タワー',       model: buildTokyoTowerModel() },
+  { h: 634,  w: 0.2,  name: '東京スカイツリー', model: buildSkytreeModel() },
+  { h: 3776, w: 2.6,  name: '富士山',           model: buildFujiModel() },
+];
+const groundRefHolder = new THREE.Group();
+groundRefHolder.visible = false;
+for (const r of GROUND_REFS) {
+  r.model.visible = false;
+  groundRefHolder.add(r.model);
+}
+const groundRefLabel = makeLabel();
+groundRefHolder.add(groundRefLabel.sprite);
+scene.add(groundRefHolder);
+const groundRef = { idx: -1, shown: false, camRadius: 0 };
+
+function updateGroundRef(vol) {
+  if (space.active || state.rocketing) {
+    groundRefHolder.visible = false;
+    return;
+  }
+  // 山の実寸半径[m]（まんじゅう密度のドーム近似）とシーン上の半径から縮尺を出す
+  const realR = Math.cbrt(Math.max(vol, MANJU_VOLUME_M3) / 1.15);
+  const sceneR = Math.max(0.8, basePileRadius) * pile.scale.x;
+  let idx = GROUND_REFS.findIndex(r => r.h > realR / 5);
+  if (idx === -1) idx = GROUND_REFS.length - 1;
+  const ref = GROUND_REFS[idx];
+  const sceneH = ref.h * sceneR / realR;
+  // 山に対して大きすぎるうちは出さない（序盤の1個 vs 人 など）
+  const visible = sceneH <= sceneR * 5;
+  groundRefHolder.visible = visible;
+  if (!visible) {
+    groundRef.shown = false;
+    groundRef.idx = -1; // 次に表示されるときに必ずモデル・ラベルを設定し直す
+    return;
+  }
+  if (idx !== groundRef.idx) {
+    for (const r of GROUND_REFS) r.model.visible = false;
+    ref.model.visible = true;
+    if (groundRef.shown && groundRef.idx >= 0 && idx > groundRef.idx) {
+      showToast(`${GROUND_REFS[groundRef.idx].name}より大きな山になりました！`);
+    }
+    groundRefLabel.set(ref.name, `高さ ${ref.h.toLocaleString('ja-JP')} m`);
+    groundRef.idx = idx;
+  }
+  groundRef.shown = true;
+  ref.model.scale.setScalar(sceneH);
+  const x = sceneR * 1.18 + sceneH * ref.w * 0.9;
+  groundRefHolder.position.set(x, 0, 0);
+  // 富士山のような幅広・大型の比較対象はカメラを引いて両方画角に収める
+  groundRef.camRadius = (x + sceneH * ref.w) / 1.6;
+  const L = THREE.MathUtils.clamp(sceneH * 1.2, 1.5, sceneR * 2.2);
+  groundRefLabel.sprite.scale.set(L, L * 220 / 1024, 1);
+  groundRefLabel.sprite.position.set(0, sceneH * 1.06 + L * 0.18, 0);
+}
+
 // ---------- 栗まんじゅうジオメトリ（上が焼き色・下が生地色の頂点カラー） ----------
 function buildManjuGeometry(wSeg, hSeg) {
   const geo = new THREE.SphereGeometry(MANJU_RADIUS, wSeg, hSeg);
@@ -708,6 +825,9 @@ function resetSim(toast) {
   pile.position.y = 0;
   pile.rotation.y = 0;
   exitSpace();
+  groundRef.idx = -1;
+  groundRef.shown = false;
+  groundRefHolder.visible = false;
   spawnManju(0, MANJU_RADIUS, 0);
   applyLOD();
   $('mode').textContent = '⚙️ 物理演算モード（Rapier）';
@@ -956,13 +1076,13 @@ function animate() {
 
   // --- 宇宙モード：天体サイズに達したら惑星→恒星→ブラックホールと姿が変わる ---
   let spaceRadius = 0;
-  if (frozen && !state.rocketing) {
-    const volNow = bigToNumber(state.count) * MANJU_VOLUME_M3;
-    if (!space.active && volNow >= SPACE_VOL) enterSpace();
-    if (space.active) {
-      spaceRadius = updateSpace(volNow, bigToNumber(state.count) * MANJU_MASS_KG);
-    }
+  const volNow = bigToNumber(state.count) * MANJU_VOLUME_M3;
+  if (frozen && !state.rocketing && !space.active && volNow >= SPACE_VOL) enterSpace();
+  if (space.active) {
+    spaceRadius = updateSpace(volNow, bigToNumber(state.count) * MANJU_MASS_KG);
   }
+  // --- 地上の比較対象（人〜富士山）を山の実寸に合わせて隣に立てる ---
+  updateGroundRef(volNow);
 
   // --- 上限超過後は「山ごと」体積比で拡大する（描画破綻を避けるため1e7倍まで） ---
   const targetScale = frozen && !state.rocketing && !space.active
@@ -974,7 +1094,9 @@ function animate() {
   }
 
   // --- カメラを山（または天体）の大きさに合わせてスムーズに引く ---
-  const radius = space.active ? Math.max(8, spaceRadius) : currentRadius();
+  const radius = space.active
+    ? Math.max(8, spaceRadius)
+    : Math.max(currentRadius(), groundRefHolder.visible ? groundRef.camRadius : 0);
   contactShadow.scale.setScalar(Math.max(1, radius * 1.1));
   contactShadow.position.y = Math.max(0.01, radius * 0.005); // 遠景でのZファイティング防止
   ground.scale.setScalar(Math.max(1, radius * 6 / 2000));
