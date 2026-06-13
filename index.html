@@ -217,18 +217,6 @@ const rim = new THREE.DirectionalLight(0x8899ff, 0.5);
 rim.position.set(-8, 4, -6);
 scene.add(rim);
 
-// 星空（宇宙感の演出・遠景）
-{
-  const starGeo = new THREE.BufferGeometry();
-  const N = 1500, pos = new Float32Array(N * 3);
-  for (let i = 0; i < N; i++) {
-    const v = new THREE.Vector3().randomDirection().multiplyScalar(1800 + Math.random() * 1200);
-    pos.set([v.x, Math.abs(v.y), v.z], i * 3);
-  }
-  starGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  scene.add(new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xfff5e0, size: 2.2, sizeAttenuation: false, transparent: true, opacity: 0.7 })));
-}
-
 // 地面
 const ground = new THREE.Mesh(
   new THREE.CircleGeometry(2000, 64).rotateX(-Math.PI / 2),
@@ -627,18 +615,22 @@ function updateGroundRef(vol) {
   // 山の実寸半径[m]（まんじゅう密度のドーム近似）とシーン上の半径から縮尺を出す
   const realR = Math.cbrt(Math.max(vol, MANJU_VOLUME_M3) / 1.15);
   const sceneR = Math.max(0.8, basePileRadius) * pile.scale.x;
-  let idx = GROUND_REFS.findIndex(r => r.h > realR / 5);
-  if (idx === -1) idx = GROUND_REFS.length - 1;
-  const ref = GROUND_REFS[idx];
-  const sceneH = ref.h * sceneR / realR;
-  // 山に対して大きすぎるうちは出さない（序盤の1個 vs 人 など）
-  const visible = sceneH <= sceneR * 5;
+  // 山が十分大きくなってから比較対象を出す。realR が対象の高さの SHOW_RATIO 倍に
+  // 達したものの中で最大を選ぶ（平たいドームでも見劣りしないよう登場を遅らせる）。
+  const SHOW_RATIO = 2.2;
+  let idx = -1;
+  for (let k = 0; k < GROUND_REFS.length; k++) {
+    if (realR >= GROUND_REFS[k].h * SHOW_RATIO) idx = k;
+  }
+  const visible = idx >= 0;
   groundRefHolder.visible = visible;
   if (!visible) {
     groundRef.shown = false;
     groundRef.idx = -1; // 次に表示されるときに必ずモデル・ラベルを設定し直す
     return;
   }
+  const ref = GROUND_REFS[idx];
+  const sceneH = ref.h * sceneR / realR;
   if (idx !== groundRef.idx) {
     for (const r of GROUND_REFS) r.model.visible = false;
     ref.model.visible = true;
@@ -716,8 +708,9 @@ const sleepSince = [];  // 静止し始めた時刻（0=動いている）
 const petrified = [];   // 石化（固定ボディ化）済みフラグ
 const matrixClean = []; // 描画行列が最新で書き直し不要
 let petrifiedCount = 0;
-let staticMaxR2 = 1, staticMaxY = 0; // 静止済みボディが占める範囲（毎フレーム再計算しない）
 let pileTopY = MANJU_RADIUS;          // 山の頂上の高さ（降り注ぎの投下高さに使う）
+// 山の局所半径 ≈ PILE_R_K × ∛(まんじゅう数)。外れ値に依存せず尺度を安定させる係数
+const PILE_R_K = 0.62;
 
 function spawnManju(x, y, z, vel) {
   const desc = RAPIER.RigidBodyDesc.dynamic()
@@ -773,29 +766,39 @@ function doublePhysical() {
 // 上限到達後の倍増演出：埋もれた（石化済みの）まんじゅうを一掴み取り出し、
 // 山の上空へワープさせて降らせる。総数は変わらないが「増え続けて降り積もる」
 // 様子が見え、山全体のスケールアップと相まって増加感が持続する。
+const _recycleCand = [];
 function pourRecycle() {
   const batch = Math.min(petrifiedCount, RECYCLE_BATCH);
   if (batch <= 0) return;
-  const R = Math.max(0.6, basePileRadius * 0.72);
+  // 中央寄り（半径の45%以内）に落として山を低く広げず、丸い山として高く保つ
+  const R = Math.max(0.5, basePileRadius * 0.45);
   const now = performance.now();
-  let moved = 0;
-  for (let i = 0; i < bodies.length && moved < batch; i++) {
-    if (!petrified[i]) continue;
+  // 外周にはみ出した石化まんじゅうを優先的に回収する（山が横に広がり続けるのを防ぐ）
+  _recycleCand.length = 0;
+  for (let i = 0; i < bodies.length; i++) {
+    if (petrified[i]) {
+      const p = bodies[i].translation();
+      _recycleCand.push([p.x * p.x + p.z * p.z, i]);
+    }
+  }
+  _recycleCand.sort((a, b) => b[0] - a[0]); // 中心から遠い順
+  const take = Math.min(batch, _recycleCand.length);
+  for (let m = 0; m < take; m++) {
+    const i = _recycleCand[m][1];
     bodies[i].setBodyType(RAPIER.RigidBodyType.Dynamic, true);
     petrified[i] = false;
     petrifiedCount--;
     const a = Math.random() * Math.PI * 2;
     const rr = Math.sqrt(Math.random()) * R;
     bodies[i].setTranslation(
-      { x: Math.cos(a) * rr, y: pileTopY + 2.5 + moved * 0.06 + Math.random() * 2, z: Math.sin(a) * rr },
+      { x: Math.cos(a) * rr, y: pileTopY + 2.5 + m * 0.06 + Math.random() * 2, z: Math.sin(a) * rr },
       true
     );
     bodies[i].setLinvel({ x: 0, y: -2, z: 0 }, true);
-    bodies[i].setAngvel({ x: (Math.random() - 0.5) * 2, y: (Math.random() - 0.5) * 2, z: (Math.random() - 0.5) * 2 }, true);
+    bodies[i].setAngvel({ x: (Math.random() - 0.5) * 1.2, y: (Math.random() - 0.5) * 1.2, z: (Math.random() - 0.5) * 1.2 }, true);
     sleepSince[i] = 0;
     matrixClean[i] = false;
     spawnTimes[i] = now; // 出現アニメをやり直してポンと現れる
-    moved++;
   }
 }
 
@@ -843,8 +846,6 @@ function resetSim(toast) {
   petrified.length = 0;
   matrixClean.length = 0;
   petrifiedCount = 0;
-  staticMaxR2 = 1;
-  staticMaxY = 0;
   pileTopY = MANJU_RADIUS;
   frozen = false;
   state.count = 1n;
@@ -988,8 +989,6 @@ $('rocketBtn').addEventListener('click', () => {
       matrixClean[i] = false;
     }
     petrifiedCount = 0;
-    staticMaxR2 = 1;
-    staticMaxY = 0;
     world.gravity.y = 18;
     for (const b of bodies) {
       const m = b.mass();
@@ -1064,7 +1063,7 @@ function animate() {
   // 静止している剛体はスキップ。さらに PETRIFY_MS 以上静止したら固定ボディ化して
   // ソルバーからも外す（山の内部・下層は二度と動かないため）
   const now = performance.now();
-  let maxR2 = staticMaxR2, maxY = staticMaxY;
+  let maxY = 0; // 打ち上げ中のカメラ追従用（動いている剛体の最高点）
   let anyWritten = false;
   for (let i = 0; i < bodies.length; i++) {
     const isStatic = petrified[i] || bodies[i].isSleeping();
@@ -1100,20 +1099,16 @@ function animate() {
     dummy.updateMatrix();
     manjuMesh.setMatrixAt(i, dummy.matrix);
     anyWritten = true;
-    const r2 = p.x * p.x + p.z * p.z + p.y * p.y * 0.5;
-    if (r2 > maxR2) maxR2 = r2;
     if (p.y > maxY) maxY = p.y;
-    if (isStatic && t >= 1) {
-      matrixClean[i] = true; // 静止確定 → 以降は書き直さず、範囲もキャッシュに畳み込む
-      if (r2 > staticMaxR2) staticMaxR2 = r2;
-      if (p.y > staticMaxY) staticMaxY = p.y;
-    } else {
-      matrixClean[i] = false;
-    }
+    // 静止確定したら以降は行列を書き直さない
+    matrixClean[i] = isStatic && t >= 1;
   }
   if (anyWritten) manjuMesh.instanceMatrix.needsUpdate = true;
-  basePileRadius = Math.sqrt(maxR2) + MANJU_RADIUS;
-  pileTopY = maxY;
+  // 山の半径は飛び散った外れ値に左右されないよう、描画中のまんじゅう数から解析的に決める
+  // （上限後は一定になり、サイズ増加は pile.scale が担う＝尺度が安定し山が正しい大きさで出る）
+  const Nr = Math.min(bodies.length, MAX_PHYS);
+  basePileRadius = PILE_R_K * Math.cbrt(Nr) + MANJU_RADIUS;
+  pileTopY = state.rocketing ? maxY : basePileRadius * 0.6;
 
   // --- 宇宙モード：天体サイズに達したら惑星→恒星→ブラックホールと姿が変わる ---
   let spaceRadius = 0;
